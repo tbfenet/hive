@@ -258,64 +258,85 @@ class MetaStoreDirectSql {
   private List<Partition> getPartitionsViaSqlFilterInternal(String dbName, String tblName,
       Boolean isView, String sqlFilter, List<? extends Object> paramsForFilter,
       List<String> joinsForFilter, Integer max) throws MetaException {
-    boolean doTrace = LOG.isDebugEnabled();
-    dbName = dbName.toLowerCase();
-    tblName = tblName.toLowerCase();
-    // We have to be mindful of order during filtering if we are not returning all partitions.
-    String orderForFilter = (max != null) ? " order by \"PART_NAME\" asc" : "";
-    if (isMySql) {
-      assert pm.currentTransaction().isActive();
-      setAnsiQuotesForMysql(); // must be inside tx together with queries
-    }
+      boolean doTrace = LOG.isDebugEnabled();
+      dbName = dbName.toLowerCase();
+      tblName = tblName.toLowerCase();
+      // We have to be mindful of order during filtering if we are not returning all partitions.
+      String orderForFilter = (max != null) ? " order by \"PART_NAME\" asc" : "";
+      if (isMySql) {
+          assert pm.currentTransaction().isActive();
+          setAnsiQuotesForMysql(); // must be inside tx together with queries
+      }
 
-    // Get all simple fields for partitions and related objects, which we can map one-on-one.
-    // We will do this in 2 queries to use different existing indices for each one.
-    // We do not get table and DB name, assuming they are the same as we are using to filter.
-    // TODO: We might want to tune the indexes instead. With current ones MySQL performs
-    // poorly, esp. with 'order by' w/o index on large tables, even if the number of actual
-    // results is small (query that returns 8 out of 32k partitions can go 4sec. to 0sec. by
-    // just adding a \"PART_ID\" IN (...) filter that doesn't alter the results to it, probably
-    // causing it to not sort the entire table due to not knowing how selective the filter is.
-    String queryText =
-        "select \"PARTITIONS\".\"PART_ID\" from \"PARTITIONS\""
-      + "  inner join \"TBLS\" on \"PARTITIONS\".\"TBL_ID\" = \"TBLS\".\"TBL_ID\" "
-      + "    and \"TBLS\".\"TBL_NAME\" = ? "
-      + "  inner join \"DBS\" on \"TBLS\".\"DB_ID\" = \"DBS\".\"DB_ID\" "
-      + "     and \"DBS\".\"NAME\" = ? "
-      + join(joinsForFilter, ' ')
-      + (StringUtils.isBlank(sqlFilter) ? "" : (" where " + sqlFilter)) + orderForFilter;
-    Object[] params = new Object[paramsForFilter.size() + 2];
-    params[0] = tblName;
-    params[1] = dbName;
-    for (int i = 0; i < paramsForFilter.size(); ++i) {
-      params[i + 2] = paramsForFilter.get(i);
-    }
+      // Get all simple fields for partitions and related objects, which we can map one-on-one.
+      // We will do this in 2 queries to use different existing indices for each one.
+      // We do not get table and DB name, assuming they are the same as we are using to filter.
+      // TODO: We might want to tune the indexes instead. With current ones MySQL performs
+      // poorly, esp. with 'order by' w/o index on large tables, even if the number of actual
+      // results is small (query that returns 8 out of 32k partitions can go 4sec. to 0sec. by
+      // just adding a \"PART_ID\" IN (...) filter that doesn't alter the results to it, probably
+      // causing it to not sort the entire table due to not knowing how selective the filter is.
+      String queryText =
+              "select \"PARTITIONS\".\"PART_ID\" from \"PARTITIONS\""
+                      + "  inner join \"TBLS\" on \"PARTITIONS\".\"TBL_ID\" = \"TBLS\".\"TBL_ID\" "
+                      + "    and \"TBLS\".\"TBL_NAME\" = ? "
+                      + "  inner join \"DBS\" on \"TBLS\".\"DB_ID\" = \"DBS\".\"DB_ID\" "
+                      + "     and \"DBS\".\"NAME\" = ? "
+                      + join(joinsForFilter, ' ')
+                      + (StringUtils.isBlank(sqlFilter) ? "" : (" where " + sqlFilter)) + orderForFilter;
+      Object[] params = new Object[paramsForFilter.size() + 2];
+      params[0] = tblName;
+      params[1] = dbName;
+      for (int i = 0; i < paramsForFilter.size(); ++i) {
+          params[i + 2] = paramsForFilter.get(i);
+      }
 
-    long start = doTrace ? System.nanoTime() : 0;
-    Query query = pm.newQuery("javax.jdo.query.SQL", queryText);
-    if (max != null) {
-      query.setRange(0, max.shortValue());
-    }
-    @SuppressWarnings("unchecked")
-    List<Object> sqlResult = (List<Object>)query.executeWithArray(params);
-    long queryTime = doTrace ? System.nanoTime() : 0;
-    if (sqlResult.isEmpty()) {
+      long start = doTrace ? System.nanoTime() : 0;
+      Query query = pm.newQuery("javax.jdo.query.SQL", queryText);
+      if (max != null) {
+          query.setRange(0, max.shortValue());
+      }
+      @SuppressWarnings("unchecked")
+      List<Object> sqlResult = (List<Object>) query.executeWithArray(params);
+      long queryTime = doTrace ? System.nanoTime() : 0;
+      if (sqlResult.isEmpty()) {
+          timingTrace(doTrace, queryText, start, queryTime);
+          return new ArrayList<Partition>(); // no partitions, bail early.
+      }
+
       timingTrace(doTrace, queryText, start, queryTime);
-      return new ArrayList<Partition>(); // no partitions, bail early.
-    }
+      List<Long> partII = Lists.newArrayList();
+      for (Object o : sqlResult) {
+          partII.add(extractSqlLong(o));
+      }
 
-    // Prepare StringBuilder for "PART_ID in (...)" to use in future queries.
-    int sbCapacity = sqlResult.size() * 7; // if there are 100k things => 6 chars, plus comma
-    StringBuilder partSb = new StringBuilder(sbCapacity);
-    // Assume db and table names are the same for all partition, that's what we're selecting for.
-    for (Object partitionId : sqlResult) {
-      partSb.append(extractSqlLong(partitionId)).append(",");
-    }
-    String partIds = trimCommaList(partSb);
-    timingTrace(doTrace, queryText, start, queryTime);
+      List<Partition> out = Lists.newArrayList();
+
+      for(List<Long> partitionIds:Lists.partition(partII,9999)) {
+          out.addAll(getPartitionsViaSqlFilterInternal(dbName,tblName,isView,partitionIds,start,params));
+
+      }
+      return out;
+  }
+
+    private List<Partition> getPartitionsViaSqlFilterInternal(String dbName, String tblName,
+                                                                Boolean isView,List<Long> partII,long start,Object[] params) throws MetaException {
+          boolean doTrace = LOG.isDebugEnabled();
+
+      // Prepare StringBuilder for "PART_ID in (...)" to use in future queries.
+      int sbCapacity = partII.size() * 7; // if there are 100k things => 6 chars, plus comma
+      StringBuilder partSb = new StringBuilder(sbCapacity);
+      // Assume db and table names are the same for all partition, that's what we're selecting for.
+
+      for (Long partitionId : partII) {
+          partSb.append(partitionId).append(",");
+      }
+      String partIds = trimCommaList(partSb);
+
+
 
     // Now get most of the other fields.
-    queryText =
+    String queryText =
       "select \"PARTITIONS\".\"PART_ID\", \"SDS\".\"SD_ID\", \"SDS\".\"CD_ID\","
     + " \"SERDES\".\"SERDE_ID\", \"PARTITIONS\".\"CREATE_TIME\","
     + " \"PARTITIONS\".\"LAST_ACCESS_TIME\", \"SDS\".\"INPUT_FORMAT\", \"SDS\".\"IS_COMPRESSED\","
@@ -326,10 +347,10 @@ class MetaStoreDirectSql {
     + "  left outer join \"SERDES\" on \"SDS\".\"SERDE_ID\" = \"SERDES\".\"SERDE_ID\" "
     + "where \"PART_ID\" in (" + partIds + ") order by \"PART_NAME\" asc";
     start = doTrace ? System.nanoTime() : 0;
-    query = pm.newQuery("javax.jdo.query.SQL", queryText);
+          Query query = pm.newQuery("javax.jdo.query.SQL", queryText);
     @SuppressWarnings("unchecked")
     List<Object[]> sqlResult2 = (List<Object[]>)query.executeWithArray(params);
-    queryTime = doTrace ? System.nanoTime() : 0;
+    long queryTime = doTrace ? System.nanoTime() : 0;
 
     // Read all the fields and create partitions, SDs and serdes.
     TreeMap<Long, Partition> partitions = new TreeMap<Long, Partition>();
@@ -337,7 +358,7 @@ class MetaStoreDirectSql {
     TreeMap<Long, SerDeInfo> serdes = new TreeMap<Long, SerDeInfo>();
     TreeMap<Long, List<FieldSchema>> colss = new TreeMap<Long, List<FieldSchema>>();
     // Keep order by name, consistent with JDO.
-    ArrayList<Partition> orderedResult = new ArrayList<Partition>(sqlResult.size());
+    ArrayList<Partition> orderedResult = new ArrayList<Partition>(partII.size());
 
     // Prepare StringBuilder-s for "in (...)" lists to use in one-to-many queries.
     StringBuilder sdSb = new StringBuilder(sbCapacity), serdeSb = new StringBuilder(sbCapacity);
